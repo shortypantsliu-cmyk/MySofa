@@ -2,8 +2,7 @@ import { useState, useEffect, useRef, useMemo } from "react";
 
 // ─── YOUR TMDB READ ACCESS TOKEN ─────────────────────────────────────────────
 // Paste your token from themoviedb.org → Settings → API → Read Access Token
-const TMDB_TOKEN = "eуJhbGciOіJIUzl1NiJ9.eyJhdWQiOil0МWY0OТFmZjJkМzАхNWЕ2ZТFiZТg4NТМzZWFhYjYzNyIslm5iZіl6МТc3NDkwМТQ1NС4×МТМ5ОТk4LCJzdWliOil2О
-WNhZDhjZWFkYzEyYzdjMmUyNjNiODYіLCJzY29wZXМiОlsiYХBpХ3JІYWQiXSwidmVyс2lvbil6МХ0.7K2gqHА1Sb64ljxtQi6DvG4Brjr_kАa3fJwV4oG_p78";
+const TMDB_TOKEN = import.meta.env.VITE_TMDB_TOKEN || "";
 
 // ─── Global Styles ────────────────────────────────────────────────────────────
 function useGlobalStyles() {
