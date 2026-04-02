@@ -495,7 +495,7 @@ function StatsPanel({items,onClose}){
       <div className="slide-down" onClick={e=>e.stopPropagation()} style={{position:'relative',background:'#F4EEE4',borderBottom:'2px solid #D0C4B0',maxHeight:'88vh',overflowY:'auto',boxShadow:'0 12px 48px rgba(0,0,0,0.18)'}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'16px 24px',borderBottom:'1px solid #DDD0BE',background:'rgba(244,238,228,0.97)',position:'sticky',top:0,zIndex:10}}>
           <span style={{fontFamily:"'Lora',serif",fontSize:18,fontWeight:700,color:'#2A1E10'}}>📊 Stats</span>
-          <button onClick={onClose} style={{background:'none',border:'none',color:'#9A8E76',cursor:'pointer',fontSize:20,lineHeight:1,padding:4}}>✕</button>
+          <button onClick={onClose} style={{background:'rgba(184,116,26,0.1)',border:'1px solid #D0C4B0',color:'#7A6E58',cursor:'pointer',fontSize:14,fontWeight:600,padding:'8px 16px',borderRadius:8,fontFamily:'inherit',lineHeight:1}}>✕ Close</button>
         </div>
         <div style={{padding:'20px 24px 30px'}}>
           {totalFinished===0?(
@@ -523,6 +523,9 @@ function StatsPanel({items,onClose}){
               </div>
             </>
           )}
+          <div style={{textAlign:'center',paddingTop:24}}>
+            <button onClick={onClose} style={{background:'rgba(184,116,26,0.1)',border:'1.5px solid #D0C4B0',color:'#7A6E58',borderRadius:10,padding:'12px 36px',fontSize:14,fontWeight:600,cursor:'pointer',fontFamily:'inherit'}}>✕ Close Stats</button>
+          </div>
         </div>
       </div>
     </div>
@@ -599,10 +602,12 @@ function ActivityLogView({items,search,onItemClick,onStatusChange}){
 }
 
 // ─── Edit Modal ───────────────────────────────────────────────────────────────
-function Modal({item,onSave,onDelete,onClose}){
+function Modal({item,items,onSave,onDelete,onClose}){
   const isNew=!item.id;
   const[form,setForm]=useState({title:'',list:'',category:'Books',status:'want',rating:0,recBy:'',notes:'',pinned:false,dateAdded:'',...item});
   const[confirmDelete,setConfirmDelete]=useState(false);
+  const existingLists=useMemo(()=>{const s=new Set();(items||[]).forEach(i=>{if(i.list&&i.list!=='Activity')s.add(i.list);});return[...s].sort();},[items]);
+  const[newListMode,setNewListMode]=useState(false);
   const set=(k,v)=>setForm(p=>({...p,[k]:v}));
   const inp={background:'#FDFAF5',border:'1px solid #D8CCBC',borderRadius:8,color:'#1E1810',padding:'9px 12px',fontSize:14,width:'100%',fontFamily:'inherit'};
   const lbl={fontSize:11.5,color:'#7A6E56',fontWeight:600,letterSpacing:0.5,textTransform:'uppercase',marginBottom:5,display:'block'};
@@ -620,7 +625,21 @@ function Modal({item,onSave,onDelete,onClose}){
         </div>
         <div><label style={lbl}>Rating {form.rating>0&&<span style={{color:'#B8741A',textTransform:'none',letterSpacing:0,fontWeight:400}}>— {form.rating} star{form.rating!==1?'s':''}</span>}</label><StarPicker value={form.rating} onChange={v=>set('rating',v)}/></div>
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
-          <div><label style={lbl}>List / Source</label><input value={form.list} onChange={e=>set('list',e.target.value)} placeholder="e.g. Netflix, To Read…" style={inp}/></div>
+          <div>
+            <label style={lbl}>List / Source</label>
+            {existingLists.length>0?(
+              <>
+                <select value={newListMode?'＋':(form.list||'')} onChange={e=>{if(e.target.value==='＋'){setNewListMode(true);set('list','');}else{setNewListMode(false);set('list',e.target.value);}}} style={{...inp,cursor:'pointer',marginBottom:newListMode?8:0}}>
+                  <option value="">— No list —</option>
+                  {existingLists.map(l=><option key={l} value={l}>{l}</option>)}
+                  <option value="＋">＋ New list…</option>
+                </select>
+                {newListMode&&<input value={form.list} onChange={e=>set('list',e.target.value)} placeholder="New list name…" style={inp} autoFocus/>}
+              </>
+            ):(
+              <input value={form.list} onChange={e=>set('list',e.target.value)} placeholder="e.g. Netflix, To Read…" style={inp}/>
+            )}
+          </div>
           <div><label style={lbl}>Recommended By</label><input value={form.recBy} onChange={e=>set('recBy',e.target.value)} placeholder="Who rec'd it?" style={inp}/></div>
         </div>
         <div><label style={lbl}>Notes</label><textarea value={form.notes} onChange={e=>set('notes',e.target.value)} placeholder="Thoughts, season notes, reminders…" rows={3} style={{...inp,resize:'vertical',lineHeight:1.55}}/></div>
@@ -765,7 +784,7 @@ export default function App(){
         )}
       </div>
 
-      {modal&&<Modal item={modal.item} onSave={saveItem} onDelete={deleteItem} onClose={()=>setModal(null)}/>}
+      {modal&&<Modal item={modal.item} items={items} onSave={saveItem} onDelete={deleteItem} onClose={()=>setModal(null)}/>}
     </div>
   );
 }
