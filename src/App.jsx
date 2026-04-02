@@ -3,6 +3,9 @@ import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 // ─── TMDB TOKEN (set via Netlify env var VITE_TMDB_TOKEN) ────────────────────
 const TMDB_TOKEN = import.meta.env.VITE_TMDB_TOKEN || "";
 
+// ─── RAWG KEY (set via Netlify env var VITE_RAWG_KEY) ────────────────────────
+const RAWG_KEY = import.meta.env.VITE_RAWG_KEY || "";
+
 // ─── Global Styles ────────────────────────────────────────────────────────────
 function useGlobalStyles() {
   useEffect(() => {
@@ -145,6 +148,22 @@ function _schedulePersist() {
   }, 1500);
 }
 
+// ─── Metadata Cache (same two-tier pattern as image cache) ───────────────────
+const META_CACHE_KEY = 'mySofa_metaCache_v1';
+const _metaCache = new Map(
+  Object.entries((() => { try { return JSON.parse(localStorage.getItem(META_CACHE_KEY)||'{}'); } catch { return {}; } })())
+);
+function getMetaCached(key) { return _metaCache.has(key) ? _metaCache.get(key) : undefined; }
+function setMetaCached(key, val) {
+  _metaCache.set(key, val);
+  if (_metaPersistTimer) clearTimeout(_metaPersistTimer);
+  _metaPersistTimer = setTimeout(() => {
+    try { localStorage.setItem(META_CACHE_KEY, JSON.stringify(Object.fromEntries(_metaCache))); } catch {}
+    _metaPersistTimer = null;
+  }, 1500);
+}
+let _metaPersistTimer = null;
+
 // ─── Per-domain parallel fetch pools ─────────────────────────────────────────
 // Each domain gets its own concurrency limit and queue
 // Priority items (visible cards) are unshifted to the front
@@ -153,6 +172,8 @@ const POOLS = {
   googleBooks:  { concurrency: 6,  active: 0, queue: [] },
   itunes:       { concurrency: 6,  active: 0, queue: [] },
   openLibrary:  { concurrency: 3,  active: 0, queue: [] },
+  rawg:         { concurrency: 4,  active: 0, queue: [] },
+  steam:        { concurrency: 4,  active: 0, queue: [] },
 };
 
 function _runPool(pool) {
@@ -230,6 +251,193 @@ async function _itunesFetch(title, media, entity) {
   return art.replace('100x100bb', '200x200bb');
 }
 
+async function _rawgFetch(title) {
+  if (!RAWG_KEY) return null;
+  const enc = encodeURIComponent(searchTitle(title));
+  const r = await fetch(`https://api.rawg.io/api/games?key=${RAWG_KEY}&search=${enc}&page_size=1&search_precise=true`);
+  const d = await r.json();
+  return d.results?.[0]?.background_image || null;
+}
+
+async function _steamFetch(title) {
+  // Search Steam store — no key needed
+  const enc = encodeURIComponent(searchTitle(title));
+  const r = await fetch(`https://store.steampowered.com/api/storesearch/?term=${enc}&l=en&cc=US`);
+  const d = await r.json();
+  const appid = d.items?.[0]?.id;
+  if (!appid) return null;
+  // Steam library portrait art (600×900) — ideal for our card aspect ratio
+  return `https://steamcdn-a.akamaihd.net/steam/apps/${appid}/library_600x900.jpg`;
+}
+
+// ─── Metadata Fetchers (on-demand, called when modal opens) ──────────────────
+
+async function _tmdbMovieMeta(title) {
+  if (!TMDB_TOKEN) return null;
+  const enc = encodeURIComponent(searchTitle(title));
+  const sr = await fetch(
+    `https://api.themoviedb.org/3/search/movie?query=${enc}&language=en-US&page=1`,
+    { headers: { Authorization: `Bearer ${TMDB_TOKEN}` } }
+  );
+  const sd = await sr.json();
+  const movie = sd.results?.[0];
+  if (!movie) return null;
+  // Second call for director from credits
+  const cr = await fetch(
+    `https://api.themoviedb.org/3/movie/${movie.id}/credits`,
+    { headers: { Authorization: `Bearer ${TMDB_TOKEN}` } }
+  );
+  const cd = await cr.json();
+  const director = cd.crew?.find(c => c.job === 'Director')?.name || null;
+  return {
+    summary: movie.overview || null,
+    creator: director, creatorLabel: 'Director',
+    date: movie.release_date ? movie.release_date.slice(0,4) : null,
+  };
+}
+
+async function _tmdbTvMeta(title) {
+  if (!TMDB_TOKEN) return null;
+  const enc = encodeURIComponent(searchTitle(title));
+  const sr = await fetch(
+    `https://api.themoviedb.org/3/search/tv?query=${enc}&language=en-US&page=1`,
+    { headers: { Authorization: `Bearer ${TMDB_TOKEN}` } }
+  );
+  const sd = await sr.json();
+  const show = sd.results?.[0];
+  if (!show) return null;
+  // Second call for created_by from show details
+  const dr = await fetch(
+    `https://api.themoviedb.org/3/tv/${show.id}`,
+    { headers: { Authorization: `Bearer ${TMDB_TOKEN}` } }
+  );
+  const dd = await dr.json();
+  const creator = dd.created_by?.map(c => c.name).join(', ') || null;
+  return {
+    summary: show.overview || null,
+    creator, creatorLabel: 'Created by',
+    date: show.first_air_date ? show.first_air_date.slice(0,4) : null,
+  };
+}
+
+async function _rawgMeta(title) {
+  if (!RAWG_KEY) return null;
+  const enc = encodeURIComponent(searchTitle(title));
+  const sr = await fetch(`https://api.rawg.io/api/games?key=${RAWG_KEY}&search=${enc}&page_size=1&search_precise=true`);
+  const sd = await sr.json();
+  const game = sd.results?.[0];
+  if (!game) return null;
+  // Second call for full description and developer
+  const dr = await fetch(`https://api.rawg.io/api/games/${game.id}?key=${RAWG_KEY}`);
+  const dd = await dr.json();
+  const raw = dd.description_raw || '';
+  // Trim to ~450 chars at a sentence boundary if possible
+  let summary = null;
+  if (raw) {
+    const trimmed = raw.slice(0, 450);
+    const lastPeriod = trimmed.lastIndexOf('. ');
+    summary = (lastPeriod > 80 ? trimmed.slice(0, lastPeriod + 1) : trimmed) + (raw.length > 450 ? '…' : '');
+  }
+  return {
+    summary,
+    creator: dd.developers?.[0]?.name || null, creatorLabel: 'Developer',
+    date: game.released ? game.released.slice(0,4) : null,
+  };
+}
+
+async function _steamMeta(title) {
+  const enc = encodeURIComponent(searchTitle(title));
+  const sr = await fetch(`https://store.steampowered.com/api/storesearch/?term=${enc}&l=en&cc=US`);
+  const sd = await sr.json();
+  const appid = sd.items?.[0]?.id;
+  if (!appid) return null;
+  const dr = await fetch(`https://store.steampowered.com/api/appdetails?appids=${appid}`);
+  const dd = await dr.json();
+  const data = dd[appid]?.data;
+  if (!data) return null;
+  return {
+    summary: data.short_description || null,
+    creator: data.developers?.[0] || null, creatorLabel: 'Developer',
+    date: data.release_date?.date || null,
+  };
+}
+
+async function _googleBooksMeta(title) {
+  const cleaned = searchTitle(title);
+  const enc = encodeURIComponent(`intitle:${cleaned}`);
+  const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${enc}&maxResults=1&fields=items(volumeInfo(description,authors,publishedDate))`);
+  const d = await r.json();
+  const info = d.items?.[0]?.volumeInfo;
+  if (!info) return null;
+  // Strip HTML tags that sometimes appear in Google Books descriptions
+  const rawDesc = info.description || null;
+  const summary = rawDesc ? rawDesc.replace(/<[^>]+>/g,'').slice(0,450) + (rawDesc.length > 450 ? '…' : '') : null;
+  return {
+    summary,
+    creator: info.authors?.slice(0,3).join(', ') || null, creatorLabel: 'Author',
+    date: info.publishedDate ? info.publishedDate.slice(0,4) : null,
+  };
+}
+
+async function _openLibraryMeta(title) {
+  const enc = encodeURIComponent(searchTitle(title));
+  const r = await fetch(`https://openlibrary.org/search.json?title=${enc}&limit=1&fields=author_name,first_publish_year`);
+  const d = await r.json();
+  const doc = d.docs?.[0];
+  if (!doc) return null;
+  return {
+    summary: null, // OL description requires a separate work fetch; skip for speed
+    creator: doc.author_name?.slice(0,3).join(', ') || null, creatorLabel: 'Author',
+    date: doc.first_publish_year ? String(doc.first_publish_year) : null,
+  };
+}
+
+async function _itunesMeta(title, media, entity, creatorLabel) {
+  const enc = encodeURIComponent(searchTitle(title));
+  const params = entity ? `entity=${entity}` : `media=${media}`;
+  const r = await fetch(`https://itunes.apple.com/search?term=${enc}&${params}&limit=1`);
+  const d = await r.json();
+  const item = d.results?.[0];
+  if (!item) return null;
+  const rawDesc = item.longDescription || item.description || null;
+  const summary = rawDesc ? rawDesc.replace(/<[^>]+>/g,'').slice(0,450) + (rawDesc.length > 450 ? '…' : '') : null;
+  return {
+    summary,
+    creator: item.artistName || null, creatorLabel,
+    date: item.releaseDate ? item.releaseDate.slice(0,4) : null,
+  };
+}
+
+async function fetchMetadata(title, category) {
+  if (!title) return null;
+  const key = `${category}::${title}`;
+  const cached = getMetaCached(key);
+  if (cached !== undefined) return cached;
+  let meta = null;
+  if (category === 'Movies') {
+    meta = await _tmdbMovieMeta(title);
+  } else if (category === 'TV Shows') {
+    meta = await _tmdbTvMeta(title);
+  } else if (category === 'Books') {
+    meta = await _googleBooksMeta(title);
+    // If no author found, try Open Library for author/date and merge
+    if (!meta?.creator) {
+      const ol = await _openLibraryMeta(title);
+      if (ol) meta = { summary: meta?.summary || null, ...ol };
+    }
+  } else if (category === 'Audiobooks') {
+    meta = await _itunesMeta(title, 'audiobook', null, 'Author');
+    if (!meta) meta = await _googleBooksMeta(title);
+  } else if (category === 'Podcasts') {
+    meta = await _itunesMeta(title, 'podcast', null, 'By');
+  } else if (category === 'Games') {
+    meta = await _rawgMeta(title);
+    if (!meta) meta = await _steamMeta(title);
+  }
+  setMetaCached(key, meta);
+  return meta;
+}
+
 // ─── Main fetchCoverArt — orchestrates sources by category ───────────────────
 async function fetchCoverArt(title, category, priority = false) {
   if (!title) return null;
@@ -277,8 +485,14 @@ async function fetchCoverArt(title, category, priority = false) {
   }
 
   if (category === 'Games') {
-    // iTunes covers iOS/Mac games well; console games gracefully fall back
-    return poolFetch('itunes', () => _itunesFetch(title, null, 'game'), priority);
+    // 1. RAWG — best coverage: Switch, PlayStation, Xbox, PC, retro
+    const rawg = await poolFetch('rawg', () => _rawgFetch(title), priority);
+    if (rawg) return rawg;
+    // 2. Steam — good PC/Mac portrait art
+    const steam = await poolFetch('steam', () => _steamFetch(title), priority);
+    if (steam) return steam;
+    // 3. iTunes software — catches iOS/Mac mobile games
+    return poolFetch('itunes', () => _itunesFetch(title, null, 'software'), priority);
   }
 
   return null;
@@ -608,7 +822,13 @@ function Modal({item,items,onSave,onDelete,onClose}){
   const[confirmDelete,setConfirmDelete]=useState(false);
   const existingLists=useMemo(()=>{const s=new Set();(items||[]).forEach(i=>{if(i.list&&i.list!=='Activity')s.add(i.list);});return[...s].sort();},[items]);
   const[newListMode,setNewListMode]=useState(false);
+  const[meta,setMeta]=useState(undefined); // undefined=loading, null=not found, obj=found
   const set=(k,v)=>setForm(p=>({...p,[k]:v}));
+
+  useEffect(()=>{
+    if(!item.id||!item.title)return; // don't fetch for new items
+    fetchMetadata(item.title,item.category).then(setMeta);
+  },[item.id,item.title,item.category]);
   const inp={background:'#FDFAF5',border:'1px solid #D8CCBC',borderRadius:8,color:'#1E1810',padding:'9px 12px',fontSize:14,width:'100%',fontFamily:'inherit'};
   const lbl={fontSize:11.5,color:'#7A6E56',fontWeight:600,letterSpacing:0.5,textTransform:'uppercase',marginBottom:5,display:'block'};
   return(
@@ -619,6 +839,31 @@ function Modal({item,items,onSave,onDelete,onClose}){
           <button onClick={onClose} style={{background:'none',border:'none',color:'#9A8E76',cursor:'pointer',fontSize:20,lineHeight:1,padding:4}}>✕</button>
         </div>
         <div><label style={lbl}>Title</label><input value={form.title} onChange={e=>set('title',e.target.value)} placeholder="Item title…" style={inp} autoFocus/></div>
+        {/* ── Metadata card (existing items only) ── */}
+        {!isNew&&(
+          <div style={{background:'#F7F2EA',border:'1px solid #E8DFCE',borderRadius:12,padding:'14px 16px',display:'flex',flexDirection:'column',gap:10}}>
+            {meta===undefined?(
+              // Loading shimmer
+              <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                <div className="shimmer" style={{height:13,width:'45%',borderRadius:6}}/>
+                <div className="shimmer" style={{height:12,width:'100%',borderRadius:6}}/>
+                <div className="shimmer" style={{height:12,width:'80%',borderRadius:6}}/>
+              </div>
+            ):meta===null?(
+              <div style={{fontSize:12.5,color:'#A09080',fontStyle:'italic'}}>No metadata found for this title.</div>
+            ):(
+              <>
+                {(meta.creator||meta.date)&&(
+                  <div style={{display:'flex',gap:16,flexWrap:'wrap'}}>
+                    {meta.creator&&<div><span style={{fontSize:11,color:'#9A8878',fontWeight:600,textTransform:'uppercase',letterSpacing:0.4}}>{meta.creatorLabel} </span><span style={{fontSize:13,color:'#2A1E10',fontWeight:500}}>{meta.creator}</span></div>}
+                    {meta.date&&<div><span style={{fontSize:11,color:'#9A8878',fontWeight:600,textTransform:'uppercase',letterSpacing:0.4}}>Year </span><span style={{fontSize:13,color:'#2A1E10',fontWeight:500}}>{meta.date}</span></div>}
+                  </div>
+                )}
+                {meta.summary&&<p style={{fontSize:13,color:'#4A3C2A',lineHeight:1.65,margin:0}}>{meta.summary}</p>}
+              </>
+            )}
+          </div>
+        )}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
           <div><label style={lbl}>Category</label><select value={form.category} onChange={e=>set('category',e.target.value)} style={{...inp,cursor:'pointer'}}>{['Books','Audiobooks','TV Shows','Movies','Games','Podcasts'].map(c=><option key={c}>{c}</option>)}</select></div>
           <div><label style={lbl}>Status</label><select value={form.status} onChange={e=>set('status',e.target.value)} style={{...inp,cursor:'pointer'}}>{STATUSES.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}</select></div>
@@ -674,6 +919,14 @@ export default function App(){
   // Prefetch covers for all items on first load if cache is cold
   useEffect(()=>{
     if(items.length>0) prefetchAll(items);
+  },[]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clear cached nulls for Games so the new fetchers get a chance to run
+  useEffect(()=>{
+    items.filter(i=>i.category==='Games').forEach(i=>{
+      const key=`Games::${i.title}`;
+      if(_memCache.get(key)===null){_memCache.delete(key);_schedulePersist();}
+    });
   },[]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleImport=e=>{
