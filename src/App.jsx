@@ -270,6 +270,76 @@ async function _steamFetch(title) {
   return `https://steamcdn-a.akamaihd.net/steam/apps/${appid}/library_600x900.jpg`;
 }
 
+// ─── Multi-result fetchers (for cover picker) ─────────────────────────────────
+async function _tmdbFetchMulti(title, type) {
+  if (!TMDB_TOKEN) return [];
+  const enc = encodeURIComponent(title); // use raw title for broader matches
+  const endpoint = type === 'movie' ? 'movie' : 'tv';
+  const r = await fetch(
+    `https://api.themoviedb.org/3/search/${endpoint}?query=${enc}&language=en-US&page=1`,
+    { headers: { Authorization: `Bearer ${TMDB_TOKEN}` } }
+  );
+  const d = await r.json();
+  return (d.results||[]).slice(0,5).filter(x=>x.poster_path).map(x=>({url:TMDB_IMG+x.poster_path,label:x.title||x.name}));
+}
+async function _googleBooksFetchMulti(title) {
+  const enc = encodeURIComponent(title);
+  const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${enc}&maxResults=5&fields=items(volumeInfo(title,authors,imageLinks))`);
+  const d = await r.json();
+  return (d.items||[]).map(item=>{
+    const links=item.volumeInfo?.imageLinks;
+    const base=links?.thumbnail||links?.smallThumbnail;
+    if(!base)return null;
+    const url=base.replace('http://','https://').replace('zoom=1','zoom=2').replace('&edge=curl','');
+    return{url,label:item.volumeInfo?.title||''};
+  }).filter(Boolean);
+}
+async function _openLibraryFetchMulti(title) {
+  const enc = encodeURIComponent(title);
+  const r = await fetch(`https://openlibrary.org/search.json?title=${enc}&limit=5&fields=title,cover_i`);
+  const d = await r.json();
+  return (d.docs||[]).filter(x=>x.cover_i).map(x=>({url:`https://covers.openlibrary.org/b/id/${x.cover_i}-M.jpg`,label:x.title||''}));
+}
+async function _itunesFetchMulti(title, media, entity) {
+  const enc = encodeURIComponent(title);
+  const params = entity ? `entity=${entity}` : `media=${media}`;
+  const r = await fetch(`https://itunes.apple.com/search?term=${enc}&${params}&limit=5`);
+  const d = await r.json();
+  return (d.results||[]).filter(x=>x.artworkUrl100).map(x=>({url:x.artworkUrl100.replace('100x100bb','200x200bb'),label:x.trackName||x.collectionName||x.artistName||''}));
+}
+async function _rawgFetchMulti(title) {
+  if (!RAWG_KEY) return [];
+  const enc = encodeURIComponent(title);
+  const r = await fetch(`https://api.rawg.io/api/games?key=${RAWG_KEY}&search=${enc}&page_size=5`);
+  const d = await r.json();
+  return (d.results||[]).filter(x=>x.background_image).map(x=>({url:x.background_image,label:x.name||''}));
+}
+
+// Fetch multiple cover options for the picker — runs all sources in parallel
+async function fetchCoverOptions(title, category) {
+  if (!title) return [];
+  let promises = [];
+  if (category === 'Movies') {
+    promises = [_tmdbFetchMulti(title,'movie'), _itunesFetchMulti(title,'movie',null)];
+  } else if (category === 'TV Shows') {
+    promises = [_tmdbFetchMulti(title,'tv'), _itunesFetchMulti(title,'tvShow',null)];
+  } else if (category === 'Books') {
+    promises = [_googleBooksFetchMulti(title), _openLibraryFetchMulti(title), _itunesFetchMulti(title,'ebook',null)];
+  } else if (category === 'Audiobooks') {
+    promises = [_itunesFetchMulti(title,'audiobook',null), _googleBooksFetchMulti(title), _openLibraryFetchMulti(title)];
+  } else if (category === 'Podcasts') {
+    promises = [_itunesFetchMulti(title,'podcast',null)];
+  } else if (category === 'Games') {
+    promises = [_rawgFetchMulti(title), _itunesFetchMulti(title,null,'software')];
+  }
+  const results = await Promise.allSettled(promises);
+  // Flatten, deduplicate by URL, limit to 8
+  const seen = new Set();
+  return results.flatMap(r=>r.status==='fulfilled'?r.value:[])
+    .filter(x=>{if(!x?.url||seen.has(x.url))return false;seen.add(x.url);return true;})
+    .slice(0,8);
+}
+
 // ─── Metadata Fetchers (on-demand, called when modal opens) ──────────────────
 
 async function _tmdbMovieMeta(title) {
@@ -499,16 +569,22 @@ async function fetchCoverArt(title, category, priority = false) {
 }
 
 // ─── useCoverArt hook with IntersectionObserver priority ────────────────────
-function useCoverArt(title, category) {
+function useCoverArt(title, category, coverOverride) {
   const key = `${category}::${title}`;
-  const cached = getCached(key);
+  // If user has manually chosen a cover, use it directly — skip cache/fetch
+  const cached = coverOverride ? coverOverride : getCached(key);
   const [url, setUrl] = useState(cached !== undefined ? cached : undefined);
-  const [loading, setLoading] = useState(cached === undefined);
+  const [loading, setLoading] = useState(!coverOverride && cached === undefined);
   const ref = useRef(null);
   const fetchedRef = useRef(false);
 
+  // If coverOverride changes (user picks a new cover), reflect it immediately
+  useEffect(()=>{
+    if(coverOverride){setUrl(coverOverride);setLoading(false);}
+  },[coverOverride]);
+
   const doFetch = useCallback((priority = false) => {
-    if (fetchedRef.current || !title) return;
+    if (fetchedRef.current || !title || coverOverride) return;
     fetchedRef.current = true;
     setLoading(true);
     fetchCoverArt(title, category, priority).then(result => {
@@ -517,10 +593,10 @@ function useCoverArt(title, category) {
       setUrl(val);
       setLoading(false);
     });
-  }, [title, category, key]);
+  }, [title, category, key, coverOverride]);
 
   useEffect(() => {
-    if (!title || url !== undefined) return;
+    if (!title || url !== undefined || coverOverride) return;
 
     // Use IntersectionObserver — visible cards fetch with priority=true
     if ('IntersectionObserver' in window) {
@@ -536,7 +612,7 @@ function useCoverArt(title, category) {
       // Fallback for browsers without IntersectionObserver
       doFetch(false);
     }
-  }, [title, category, url, doFetch]);
+  }, [title, category, url, doFetch, coverOverride]);
 
   return { url, loading, ref };
 }
@@ -573,7 +649,7 @@ function CoverPlaceholder({category,title}){
 
 // ─── Card ─────────────────────────────────────────────────────────────────────
 function Card({item,onClick,onStatusChange}){
-  const{url,loading,ref}=useCoverArt(item.title,item.category);
+  const{url,loading,ref}=useCoverArt(item.title,item.category,item.coverOverride||null);
   const[imgErr,setImgErr]=useState(false);
   const showPlaceholder=!loading&&(!url||imgErr);
   return(
@@ -823,8 +899,37 @@ function Modal({item,items,onSave,onDelete,onClose}){
   const existingLists=useMemo(()=>{const s=new Set();(items||[]).forEach(i=>{if(i.list&&i.list!=='Activity')s.add(i.list);});return[...s].sort();},[items]);
   const[newListMode,setNewListMode]=useState(false);
   const[meta,setMeta]=useState(undefined); // undefined=loading, null=not found, obj=found
+  const[showCoverPicker,setShowCoverPicker]=useState(false);
+  const[coverOptions,setCoverOptions]=useState([]);
+  const[coverLoading,setCoverLoading]=useState(false);
+  const[coverSearch,setCoverSearch]=useState('');
+  const[customUrl,setCustomUrl]=useState('');
   const set=(k,v)=>setForm(p=>({...p,[k]:v}));
 
+  const loadCoverOptions = useCallback(async (searchTerm) => {
+    setCoverLoading(true); setCoverOptions([]);
+    const opts = await fetchCoverOptions(searchTerm||form.title, form.category);
+    setCoverOptions(opts); setCoverLoading(false);
+  }, [form.title, form.category]);
+
+  const openCoverPicker = () => {
+    setShowCoverPicker(true);
+    setCoverSearch('');
+    setCustomUrl('');
+    loadCoverOptions('');
+  };
+
+  const pickCover = (url) => {
+    set('coverOverride', url);
+    // Also update the image cache so Cards update immediately on re-mount
+    setCached(`${form.category}::${form.title}`, url);
+    setShowCoverPicker(false);
+  };
+
+  useEffect(()=>{
+    if(!item.id||!item.title)return; // don't fetch for new items
+    fetchMetadata(item.title,item.category).then(setMeta);
+  },[item.id,item.title,item.category]);
   useEffect(()=>{
     if(!item.id||!item.title)return; // don't fetch for new items
     fetchMetadata(item.title,item.category).then(setMeta);
@@ -861,6 +966,61 @@ function Modal({item,items,onSave,onDelete,onClose}){
                 )}
                 {meta.summary&&<p style={{fontSize:13,color:'#4A3C2A',lineHeight:1.65,margin:0}}>{meta.summary}</p>}
               </>
+            )}
+          </div>
+        )}
+        {/* ── Cover picker (existing items only) ── */}
+        {!isNew&&(
+          <div>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:showCoverPicker?10:0}}>
+              <div style={{display:'flex',alignItems:'center',gap:10}}>
+                {/* Mini current cover preview */}
+                {(form.coverOverride||getCached(`${form.category}::${form.title}`))&&(
+                  <img src={form.coverOverride||getCached(`${form.category}::${form.title}`)} alt="" style={{width:36,height:54,objectFit:'cover',borderRadius:4,border:'1px solid #DDD0BE',flexShrink:0}}/>
+                )}
+                <button onClick={()=>showCoverPicker?setShowCoverPicker(false):openCoverPicker()}
+                  style={{background:'transparent',border:'1px solid #D0C4B0',color:'#7A6E58',borderRadius:7,padding:'6px 12px',fontSize:12.5,cursor:'pointer',fontFamily:'inherit'}}>
+                  {showCoverPicker?'Hide cover picker':'🖼 Fix cover…'}
+                </button>
+                {form.coverOverride&&<button onClick={()=>{set('coverOverride',null);setCached(`${form.category}::${form.title}`,undefined);}} style={{background:'transparent',border:'none',color:'#A09080',fontSize:12,cursor:'pointer',fontFamily:'inherit',textDecoration:'underline'}}>Reset</button>}
+              </div>
+            </div>
+            {showCoverPicker&&(
+              <div style={{background:'#F7F2EA',border:'1px solid #E8DFCE',borderRadius:12,padding:'14px'}}>
+                {/* Search override */}
+                <div style={{display:'flex',gap:8,marginBottom:12}}>
+                  <input value={coverSearch} onChange={e=>setCoverSearch(e.target.value)}
+                    onKeyDown={e=>e.key==='Enter'&&loadCoverOptions(coverSearch)}
+                    placeholder="Search different term…" style={{...inp,flex:1,fontSize:13,padding:'7px 10px'}}/>
+                  <button onClick={()=>loadCoverOptions(coverSearch)} style={{background:'#B8741A',border:'none',color:'#FFF8EE',borderRadius:8,padding:'7px 14px',fontSize:13,cursor:'pointer',fontFamily:'inherit',fontWeight:600,whiteSpace:'nowrap'}}>Search</button>
+                </div>
+                {/* Thumbnail grid */}
+                {coverLoading?(
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
+                    {[1,2,3,4].map(n=><div key={n} className="shimmer" style={{paddingTop:'148%',borderRadius:6}}/>)}
+                  </div>
+                ):coverOptions.length===0?(
+                  <div style={{textAlign:'center',padding:'16px 0',color:'#A09080',fontSize:13}}>No results found — try a different search term or paste a URL below.</div>
+                ):(
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:12}}>
+                    {coverOptions.map((opt,i)=>(
+                      <div key={i} onClick={()=>pickCover(opt.url)} title={opt.label}
+                        style={{cursor:'pointer',borderRadius:6,overflow:'hidden',border:form.coverOverride===opt.url?'2.5px solid #B8741A':'2px solid transparent',transition:'border 0.1s',position:'relative',paddingTop:'148%',background:'#EDE5D5'}}>
+                        <img src={opt.url} alt={opt.label} style={{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover'}}
+                          onError={e=>{e.target.style.display='none';}}/>
+                        {form.coverOverride===opt.url&&<div style={{position:'absolute',top:4,right:4,background:'#B8741A',borderRadius:'50%',width:18,height:18,display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,color:'#fff'}}>✓</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* URL paste fallback */}
+                <div style={{borderTop:'1px solid #E0D5C5',paddingTop:10,display:'flex',gap:8}}>
+                  <input value={customUrl} onChange={e=>setCustomUrl(e.target.value)}
+                    placeholder="Or paste an image URL…" style={{...inp,flex:1,fontSize:13,padding:'7px 10px'}}/>
+                  <button onClick={()=>customUrl.trim()&&pickCover(customUrl.trim())} disabled={!customUrl.trim()}
+                    style={{background:customUrl.trim()?'#B8741A':'#D0C4B0',border:'none',color:customUrl.trim()?'#FFF8EE':'#9A8E76',borderRadius:8,padding:'7px 14px',fontSize:13,cursor:customUrl.trim()?'pointer':'default',fontFamily:'inherit',fontWeight:600,whiteSpace:'nowrap'}}>Use URL</button>
+                </div>
+              </div>
             )}
           </div>
         )}
