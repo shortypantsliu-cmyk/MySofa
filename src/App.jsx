@@ -912,9 +912,39 @@ export default function App(){
   const[search,setSearch]=useState('');
   const[modal,setModal]=useState(null);
   const[showStats,setShowStats]=useState(false);
+  const[syncStatus,setSyncStatus]=useState('loading'); // 'loading'|'synced'|'saving'|'offline'
   const fileRef=useRef();
+  const syncTimerRef=useRef(null);
+  const skipNextPostRef=useRef(true); // skip initial mount + Blobs load triggers
 
-  useEffect(()=>{try{localStorage.setItem('mySofa_v1',JSON.stringify(items));}catch{}},[items]);
+  // On mount: pull latest library from Blobs, replace local state
+  useEffect(()=>{
+    fetch('/api/library')
+      .then(r=>r.ok?r.json():Promise.reject())
+      .then(data=>{
+        if(Array.isArray(data)){
+          skipNextPostRef.current=true; // don't echo back what we just loaded
+          setItems(data);
+          try{localStorage.setItem('mySofa_v1',JSON.stringify(data));}catch{}
+        }
+        setSyncStatus('synced');
+      })
+      .catch(()=>setSyncStatus('offline')); // offline: keep working from localStorage
+  },[]);
+
+  // On items change: save to localStorage immediately, debounce POST to Blobs
+  useEffect(()=>{
+    try{localStorage.setItem('mySofa_v1',JSON.stringify(items));}catch{}
+    if(skipNextPostRef.current){skipNextPostRef.current=false;return;}
+    setSyncStatus('saving');
+    if(syncTimerRef.current)clearTimeout(syncTimerRef.current);
+    syncTimerRef.current=setTimeout(()=>{
+      fetch('/api/library',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(items)})
+        .then(r=>r.ok?r.json():Promise.reject())
+        .then(d=>setSyncStatus(d.ok?'synced':'offline'))
+        .catch(()=>setSyncStatus('offline'));
+    },1500);
+  },[items]);
 
   // Prefetch covers for all items on first load if cache is cold
   useEffect(()=>{
@@ -984,6 +1014,11 @@ export default function App(){
         <div style={{display:'flex',alignItems:'baseline',gap:10}}>
           <span style={{fontFamily:"'Lora',serif",fontSize:22,fontWeight:700,color:'#2A1E10',letterSpacing:-0.3}}>✦ MySofa</span>
           {items.length>0&&<span style={{fontSize:12,color:'#A09080'}}>{items.length.toLocaleString()} items</span>}
+          {/* Sync status pill */}
+          {syncStatus==='loading'&&<span style={{fontSize:11,color:'#9A8878',background:'#EDE5D5',borderRadius:10,padding:'2px 8px'}}>↻ Loading…</span>}
+          {syncStatus==='saving'&&<span style={{fontSize:11,color:'#B45309',background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:10,padding:'2px 8px'}}>↑ Saving…</span>}
+          {syncStatus==='synced'&&<span style={{fontSize:11,color:'#15803D',background:'#F0FDF4',border:'1px solid #BBF7D0',borderRadius:10,padding:'2px 8px'}}>✓ Synced</span>}
+          {syncStatus==='offline'&&<span title="Changes saved locally — will sync when back online" style={{fontSize:11,color:'#B45309',background:'#FFF7ED',border:'1px solid #FED7AA',borderRadius:10,padding:'2px 8px',cursor:'default'}}>⚠ Offline</span>}
         </div>
         <div style={{display:'flex',gap:7,alignItems:'center',flexWrap:'wrap'}}>
           <input ref={fileRef} type="file" accept=".csv" onChange={handleImport} style={{display:'none'}}/>
