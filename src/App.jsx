@@ -478,11 +478,11 @@ async function _itunesMeta(title, media, entity, creatorLabel) {
   };
 }
 
-async function fetchMetadata(title, category) {
+async function fetchMetadata(title, category, bypassCache=false) {
   if (!title) return null;
   const key = `${category}::${title}`;
   const cached = getMetaCached(key);
-  if (cached !== undefined) return cached;
+  if (!bypassCache && cached !== undefined) return cached;
   let meta = null;
   if (category === 'Movies') {
     meta = await _tmdbMovieMeta(title);
@@ -868,24 +868,141 @@ function CategoryView({items,category,search,onItemClick,onStatusChange}){
 }
 
 // ─── Activity Log View ────────────────────────────────────────────────────────
+const MONTH_NAMES=['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function MonthAccordion({monthName,items,defaultOpen,onItemClick,onStatusChange}){
+  const[open,setOpen]=useState(defaultOpen);
+  return(
+    <div style={{border:'1px solid #EAE0D0',borderRadius:10,overflow:'hidden',marginBottom:6}}>
+      <div className="accordion-hd" onClick={()=>setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',background:open?'rgba(184,116,26,0.03)':'#FDFBF7'}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <span style={{fontSize:13,fontWeight:600,color:'#4A3C2A'}}>{monthName}</span>
+          <span style={{fontSize:11,color:'#B8741A',background:'rgba(184,116,26,0.1)',borderRadius:10,padding:'1px 7px',fontWeight:600}}>{items.length}</span>
+        </div>
+        <span style={{fontSize:14,color:'#9A8068',transition:'transform 0.2s',transform:open?'rotate(180deg)':'rotate(0deg)'}}>⌄</span>
+      </div>
+      {open&&(
+        <div style={{padding:'10px 10px 12px',background:'#FDFBF7',borderTop:'1px solid #EDE5D5'}}>
+          <CardGrid items={items} onItemClick={onItemClick} onStatusChange={onStatusChange}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function YearAccordion({year,months,defaultOpen,onItemClick,onStatusChange}){
+  const[open,setOpen]=useState(defaultOpen);
+  const total=useMemo(()=>Object.values(months).reduce((s,a)=>s+a.length,0),[months]);
+  // Most recent month in this year
+  const monthKeys=Object.keys(months).map(Number).sort((a,b)=>b-a);
+  return(
+    <div style={{border:'1px solid #DDD0BE',borderRadius:13,overflow:'hidden',marginBottom:12,boxShadow:'0 1px 4px rgba(0,0,0,0.04)'}}>
+      <div className="accordion-hd" onClick={()=>setOpen(o=>!o)}
+        style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'13px 18px',background:open?'rgba(184,116,26,0.05)':'#FDFAF5'}}>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <span style={{fontFamily:"'Lora',serif",fontSize:17,fontWeight:700,color:'#2A1E10'}}>{year}</span>
+          <span style={{fontSize:12,color:'#7A6E5A',background:'#F0E8D8',borderRadius:10,padding:'2px 9px',fontWeight:600}}>{total} item{total!==1?'s':''}</span>
+        </div>
+        <span style={{fontSize:16,color:'#9A8068',transition:'transform 0.2s',transform:open?'rotate(180deg)':'rotate(0deg)'}}>⌄</span>
+      </div>
+      {open&&(
+        <div style={{padding:'12px 12px 14px',background:'#F9F6F1',borderTop:'1px solid #E8DFCE'}}>
+          {monthKeys.map((m,idx)=>(
+            <MonthAccordion
+              key={m}
+              monthName={MONTH_NAMES[m]}
+              items={months[m]}
+              defaultOpen={idx===0} // most recent month open by default
+              onItemClick={onItemClick}
+              onStatusChange={onStatusChange}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ActivityLogView({items,search,onItemClick,onStatusChange}){
   const[catFilt,setCatFilt]=useState('all');
+  const[ratingFilt,setRatingFilt]=useState(0); // 0=all, 4=4+stars, 5=5stars only
+
   const finished=useMemo(()=>{
     let base=items.filter(i=>i.status==='finished');
     if(catFilt!=='all')base=base.filter(i=>i.category===catFilt);
+    if(ratingFilt>0)base=base.filter(i=>i.rating>=ratingFilt);
     if(search)base=base.filter(i=>i.title.toLowerCase().includes(search.toLowerCase()));
-    return base.sort((a,b)=>parseSofaDate(b.dateAdded)-parseSofaDate(a.dateAdded));
-  },[items,catFilt,search]);
-  const counts=useMemo(()=>{const all=items.filter(i=>i.status==='finished');const c={all:all.length};MEDIA_TABS.forEach(t=>{c[t]=all.filter(i=>i.category===t).length;});return c;},[items]);
+    return base;
+  },[items,catFilt,ratingFilt,search]);
+
+  // Group into { year: { month: [items] } }, sorted newest first
+  const grouped=useMemo(()=>{
+    const g={};
+    finished.forEach(i=>{
+      const ts=parseSofaDate(i.dateAdded);
+      const d=ts?new Date(ts):null;
+      const year=d?d.getFullYear():'Unknown';
+      const month=d?d.getMonth():null;
+      if(!g[year])g[year]={};
+      const mk=month!==null?month:'?';
+      if(!g[year][mk])g[year][mk]=[];
+      g[year][mk].push(i);
+    });
+    // Sort items within each month newest first
+    Object.values(g).forEach(months=>Object.values(months).forEach(arr=>arr.sort((a,b)=>parseSofaDate(b.dateAdded)-parseSofaDate(a.dateAdded))));
+    return g;
+  },[finished]);
+
+  const years=useMemo(()=>Object.keys(grouped).sort((a,b)=>b-a),[grouped]);
+  const mostRecentYear=years[0];
+
+  const counts=useMemo(()=>{
+    const all=items.filter(i=>i.status==='finished');
+    const c={all:all.length};
+    MEDIA_TABS.forEach(t=>{c[t]=all.filter(i=>i.category===t).length;});
+    c.r4=all.filter(i=>i.rating>=4).length;
+    c.r5=all.filter(i=>i.rating===5).length;
+    return c;
+  },[items]);
+
   const ps=active=>({background:active?'rgba(184,116,26,0.12)':'transparent',border:`1px solid ${active?'#B8741A':'#D8CCBC'}`,color:active?'#92540A':'#6A5E48',borderRadius:20,padding:'4px 12px',fontSize:12.5,cursor:'pointer',fontFamily:'inherit',fontWeight:active?600:400,transition:'all 0.12s',whiteSpace:'nowrap'});
+
   return(
     <div>
-      <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:16}}>
+      {/* Category filter pills */}
+      <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:8}}>
         <button style={ps(catFilt==='all')} onClick={()=>setCatFilt('all')}>All ({counts.all})</button>
         {MEDIA_TABS.filter(t=>counts[t]>0).map(t=><button key={t} style={ps(catFilt===t)} onClick={()=>setCatFilt(catFilt===t?'all':t)}>{TAB_ICON[t]} {t} ({counts[t]})</button>)}
       </div>
-      {finished.length===0?(<div style={{textAlign:'center',padding:'60px 20px',color:'#A09080'}}><div style={{fontSize:32,marginBottom:10,opacity:0.4}}>📋</div><div style={{fontSize:14}}>{search?`Nothing matching "${search}"`:'Nothing in your Activity Log yet'}</div></div>):(
-        <><div style={{fontSize:12,color:'#A09080',marginBottom:12}}>{finished.length.toLocaleString()} item{finished.length!==1?'s':''}</div><CardGrid items={finished} onItemClick={onItemClick} onStatusChange={onStatusChange}/></>
+      {/* Rating filter pills */}
+      {(counts.r4>0||counts.r5>0)&&(
+        <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:16,paddingTop:6,borderTop:'1px solid #EDE5D5'}}>
+          <span style={{fontSize:12,color:'#A09080',alignSelf:'center',paddingRight:2}}>Rating:</span>
+          <button style={ps(ratingFilt===0)} onClick={()=>setRatingFilt(0)}>Any</button>
+          {counts.r4>0&&<button style={ps(ratingFilt===4)} onClick={()=>setRatingFilt(ratingFilt===4?0:4)}>★★★★+ ({counts.r4})</button>}
+          {counts.r5>0&&<button style={ps(ratingFilt===5)} onClick={()=>setRatingFilt(ratingFilt===5?0:5)}>★★★★★ ({counts.r5})</button>}
+        </div>
+      )}
+      {finished.length===0?(
+        <div style={{textAlign:'center',padding:'60px 20px',color:'#A09080'}}>
+          <div style={{fontSize:32,marginBottom:10,opacity:0.4}}>📋</div>
+          <div style={{fontSize:14}}>{search?`Nothing matching "${search}"`:'Nothing in your Activity Log yet'}</div>
+        </div>
+      ):(
+        <>
+          <div style={{fontSize:12,color:'#A09080',marginBottom:14}}>{finished.length.toLocaleString()} item{finished.length!==1?'s':''}</div>
+          {years.map(year=>(
+            <YearAccordion
+              key={year}
+              year={year}
+              months={grouped[year]}
+              defaultOpen={year===mostRecentYear||!!search||catFilt!=='all'||ratingFilt>0}
+              onItemClick={onItemClick}
+              onStatusChange={onStatusChange}
+            />
+          ))}
+        </>
       )}
     </div>
   );
@@ -904,11 +1021,14 @@ function Modal({item,items,onSave,onDelete,onClose}){
   const[coverLoading,setCoverLoading]=useState(false);
   const[coverSearch,setCoverSearch]=useState('');
   const[customUrl,setCustomUrl]=useState('');
+  const[activeSearchTerm,setActiveSearchTerm]=useState(''); // tracks what term produced current results
   const set=(k,v)=>setForm(p=>({...p,[k]:v}));
 
   const loadCoverOptions = useCallback(async (searchTerm) => {
+    const term = searchTerm||form.title;
+    setActiveSearchTerm(term);
     setCoverLoading(true); setCoverOptions([]);
-    const opts = await fetchCoverOptions(searchTerm||form.title, form.category);
+    const opts = await fetchCoverOptions(term, form.category);
     setCoverOptions(opts); setCoverLoading(false);
   }, [form.title, form.category]);
 
@@ -921,17 +1041,21 @@ function Modal({item,items,onSave,onDelete,onClose}){
 
   const pickCover = (url) => {
     set('coverOverride', url);
-    // Also update the image cache so Cards update immediately on re-mount
     setCached(`${form.category}::${form.title}`, url);
     setShowCoverPicker(false);
+    // Re-fetch metadata using the same search term that found this cover
+    if(activeSearchTerm && activeSearchTerm !== form.title) {
+      setMeta(undefined); // show shimmer while loading
+      fetchMetadata(activeSearchTerm, form.category, true).then(newMeta => {
+        setMeta(newMeta);
+        // Store under the original key so it persists correctly
+        setMetaCached(`${form.category}::${form.title}`, newMeta);
+      });
+    }
   };
 
   useEffect(()=>{
-    if(!item.id||!item.title)return; // don't fetch for new items
-    fetchMetadata(item.title,item.category).then(setMeta);
-  },[item.id,item.title,item.category]);
-  useEffect(()=>{
-    if(!item.id||!item.title)return; // don't fetch for new items
+    if(!item.id||!item.title)return;
     fetchMetadata(item.title,item.category).then(setMeta);
   },[item.id,item.title,item.category]);
   const inp={background:'#FDFAF5',border:'1px solid #D8CCBC',borderRadius:8,color:'#1E1810',padding:'9px 12px',fontSize:14,width:'100%',fontFamily:'inherit'};
